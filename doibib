@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+
+_VERSION = "0.1"
+
+import urllib.request
+import urllib.parse
+import sys
+import re
+from optparse import OptionParser
+
+import logging
+_LOG = logging.getLogger(__name__)
+
+import http.cookiejar
+__cookiejar = http.cookiejar.CookieJar()
+__opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(__cookiejar))
+urllib.request.install_opener(__opener)
+
+_FAKE_USER_AGENT = "Mozilla/5.0 (X11; U; Linux i686) Gecko/20071127 Firefox/2.0.0.11 (Stupid user agent filtering!)"
+
+def doiurl(doi):
+	"""Given a DOI string, returns the (redirected) URL"""
+	url = "http://dx.doi.org/"+doi
+	req = urllib.request.Request(url)
+	# dx.doi.org seems to check the user agent
+	req.add_header("User-Agent", _FAKE_USER_AGENT)
+	f = urllib.request.urlopen(req)
+	return f.geturl() # follow redirect
+
+_FETCHERS = dict()
+# and a decorator to fill _FETCHERS:
+def fetching(netloc):
+	def wrapper(func):
+		_FETCHERS[netloc] = func
+		return func
+	return wrapper
+
+def extract_query_value(url, key):
+	url = urllib.parse.urlparse(url)
+	query = urllib.parse.parse_qsl(url.query)
+	for k,v in query:
+		if k == key:
+			return v
+
+_RE_SPRING_EVENT_VALUE = re.compile(r'<input type="hidden" name="__EVENTVALIDATION" id="__EVENTVALIDATION" value="([^"]+)" />')
+_RE_SPRING_VIEW_STATE  = re.compile(r'<input type="hidden" name="__VIEWSTATE" id="__VIEWSTATE" value="([^"]+)" />')
+@fetching('www.springerlink.com')
+def _springer_fetcher(url):
+	url += "export-citation/"
+
+	# fetch cookie and magic values first
+	req = urllib.request.Request(url)
+	req.add_header("User-Agent", _FAKE_USER_AGENT)
+	f = urllib.request.urlopen(req)
+	raw = f.read().decode('utf8')
+	event_value = _RE_SPRING_EVENT_VALUE.search(raw).group(1)
+	view_state  = _RE_SPRING_VIEW_STATE.search(raw).group(1)
+	_LOG.debug("cookie fetched from '%s'" % url)
+
+	# lots of ASP crap
+	data = {
+		"__VIEWSTATE": view_state,
+		"ctl00$ctl19$cultureList": "de-de",
+		"ctl00$ctl19$SearchControl$BasicSearchForTextBox": "",
+		"ctl00$ctl19$SearchControl$BasicAuthorOrEditorTextBox": "",
+		"ctl00$ctl19$SearchControl$BasicPublicationTextBox": "",
+		"ctl00$ctl19$SearchControl$BasicVolumeTextBox": "",
+		"ctl00$ctl19$SearchControl$BasicIssueTextBox": "",
+		"ctl00$ctl19$SearchControl$BasicPageTextBox": "",
+		"ctl00$ctl19$SearchControl$AdvancedSearchForField$SearchForTextBox": "",
+		"ctl00$ctl19$SearchControl$SearchWithinOptions": "fulltext",
+		"ctl00$ctl19$SearchControl$AdvancedDoiQueryField$DOITextBox": "",
+		"ctl00$ctl19$SearchControl$AdvancedAuthorQueryField$AuthorTextBox": "",
+		"ctl00$ctl19$SearchControl$AdvancedEditorQueryField$EditorTextBox": "",
+		"ctl00$ctl19$SearchControl$AdvancedPublicationQueryField$PublicationTextBox": "",
+		"ctl00$ctl19$SearchControl$AdvancedVolumeQueryField$VolumeTextBox": "",
+		"ctl00$ctl19$SearchControl$AdvancedIssueQueryField$IssueTextBox": "",
+		"ctl00$ctl19$SearchControl$AdvancedPageQueryField$PageTextBox": "",
+		"ctl00$ctl19$SearchControl$AdvancedCategoryField$CategoryDropDownList": "all",
+		"ctl00$ctl19$SearchControl$AdvancedPublicationDates": "AdvancedPublicationDatesAll",
+		"ctl00$ctl19$SearchControl$AdvancedPublicationDatesRange$ctl00$DatePicker": "",
+		"ctl00$ctl19$SearchControl$AdvancedPublicationDatesRange$ctl01$DatePicker": "",
+		"ctl00$ctl19$SearchControl$AdvancedOrderOfResults": "AdvancedOrderOfResultsRelevance",
+		"ctl00$ContentPrimary$ctl00$ctl00$Export": "AbstractRadioButton",
+		"ctl00$ContentPrimary$ctl00$ctl00$CitationManagerDropDownList": "BibTex",
+		"ctl00$ContentPrimary$ctl00$ctl00$ExportCitationButton": "Zitierung exportieren",
+		"__EVENTVALIDATION": event_value,
+	}
+	data = urllib.parse.urlencode(data).encode("ascii")
+	req = urllib.request.Request(url, data=data)
+	req.add_header("User-Agent", _FAKE_USER_AGENT)
+	_LOG.debug("fetch from '%s'" % (url))
+	f = urllib.request.urlopen(req)
+	raw = f.read().decode('utf8').replace("\r", "")
+	return raw
+
+@fetching('dl.acm.org')
+def _acm_fetcher(url):
+	url = urllib.parse.urlparse(url)
+	query = url.query
+	doid = dict(urllib.parse.parse_qsl(query))['doid']
+	doid_a, doid_b = doid.split(".")
+	r_url = "http://%s/exportformats.cfm?id=%s&expformat=bibtex" % (url.netloc, doid_b)
+	_LOG.debug("acm url is '%s'" % r_url)
+	req = urllib.request.Request(r_url)
+	req.add_header("User-Agent", _FAKE_USER_AGENT)
+	f = urllib.request.urlopen(req)
+	bibtex = ""
+	lines = f.readlines()
+	if not lines:
+		return None
+	while not lines[0].decode('ascii', 'ignore').startswith('<PRE id="%s">' % doid_b):
+		lines.pop(0)
+	lines.pop(0)
+	while not lines[0].startswith(b'</pre>'):
+		bibtex += lines[0].decode('utf8')
+		lines.pop(0)
+	return bibtex
+
+_RE_IEEE_RECORDID = re.compile('"http://ieeexplore\.ieee\.org/xpls/abs_all\.jsp\?arnumber=([0-9]+)"')
+@fetching('ieeexplore.ieee.org')
+def _ieee_fetcher(url):
+	recordid = extract_query_value(url, 'arnumber')
+	r_url = "http://ieeexplore.ieee.org/xpl/downloadCitations"
+	data = {
+		"citation-format": "citation-abstract",
+		"download-format": "download-bibtex",
+		"fromPageName": "abstract",
+		"fromPageName": "abstract",
+		"recordIds": recordid,
+	}
+	data = urllib.parse.urlencode(data).encode("ascii")
+	req = urllib.request.Request(r_url, data=data)
+	req.add_header("User-Agent", _FAKE_USER_AGENT)
+	_LOG.debug("fetch from '%s'" % (url))
+	f = urllib.request.urlopen(req)
+	raw = f.read().decode('utf8')
+	return raw.replace("\r", "").replace("<br>", "")
+
+def fetch(doi):
+	"""Given a DOI string, returns the bib data"""
+	_LOG.info("fetching '%s'" % doi)
+	url = doiurl(doi)
+	_LOG.debug("resolved url is '%s'" % url)
+	netloc = urllib.parse.urlparse(url)[1]
+	fetcher = _FETCHERS.get(netloc, None)
+	if not fetcher:
+		_LOG.info("No fetcher for '%s'" % netloc)
+		return None
+	try:
+		return fetcher(url).strip() + "\n"
+	except Exception as e:
+		_LOG.debug(e)
+		_LOG.warn("fetching '%s' from '%s' failed with exception" % (doi, netloc))
+		return None
+
+def doi2bib(path):
+	assert (path.endswith('.doibib'))
+	out_path = path[:-7]+'.bib'
+	with open(path) as fh_in:
+		with open(out_path, 'w') as fh_out:
+			for line in fh_in:
+				if line.startswith('#') or line.startswith('\n'):
+					continue # skip comment lines
+				label, doi = line.split()
+				bibtex = fetch(doi)
+				if not bibtex:
+					_LOG.info("no bibtex! skipping %s: '%s'" % (label, doi))
+					continue
+				i = bibtex.index('{')+1
+				j = bibtex.index(',')
+				bibtex = bibtex[:i] + label + bibtex[j:]
+				fh_out.write(bibtex)
+				fh_out.write("\n\n")
+				_LOG.info("success with %s: '%s'" % (label, doi))
+
+_parser = OptionParser(version=_VERSION)
+_parser.add_option("-d", "--debug", action="store_true", dest="debug", default=False, help="print debug output")
+_parser.add_option("-q", "--quiet", action="store_true", dest="quiet", default=False, help="print no warnings")
+
+if __name__ == "__main__":
+	(options, args) = _parser.parse_args()
+	logger = logging.getLogger(__name__)
+	if options.debug:
+		logger.setLevel(logging.DEBUG)
+	elif options.quiet:
+		logger.setLevel(logging.ERROR)
+	else:
+		logger.setLevel(logging.WARN)
+	if not args:
+		_LOG.error("no input files")
+	else:
+		for path in args:
+			if not path.endswith(".doibib"):
+				_LOG.warn("filename does not have .doibib extension! skip: "+path)
+				continue
+			doi2bib(path)
